@@ -1,0 +1,542 @@
+# Import necessary libraries
+from scipy import ndimage
+import os
+import glob
+import xarray as xr
+import numpy as np
+from skimage.measure import label
+from skimage.measure import regionprops
+from collections import OrderedDict
+import networkx as nx
+import math
+import datetime
+from datetime import timedelta
+import subprocess
+import pandas as pd
+from networkx.algorithms.dag import dag_longest_path
+
+# Define the convolution function
+def convolve(two_d_arr, R, Th):
+    # Apply uniform filter convolution
+    convolved = ndimage.uniform_filter(two_d_arr, size=2*R+1, mode='constant')
+    # Thresholding
+    convolved[convolved < Th] = 0
+    convolved[convolved > 0] = 1
+    return convolved
+
+
+
+
+
+# Open the dataset
+rad_day = xr.open_dataset('sample_data/3_20160114_rainrate.nc')#, engine='netcdf4')
+rad_day = rad_day.chunk({'time': 'auto'})
+
+# Load the dataset, replace NaNs with 0 and negative values with 0
+ds = rad_day.rainrate.fillna(0).where(rad_day.rainrate.fillna(0) >= 0, 0)
+
+# Apply convolution function to precipitation maps
+ds_convolved = xr.apply_ufunc(
+    convolve,
+    ds,
+    kwargs={'R': 3, 'Th': 3},
+    dask='parallelized',
+    output_dtypes=[np.float32]
+)
+
+# Check if the sum of convolved data is greater than 0
+if ds_convolved.sum().values > 0:
+    
+    # Creating the convolved objects
+    ds_mask = ds_convolved
+    ds_mask = ds_mask.fillna(0)
+    ds_mask = ds_mask.where(ds_mask <= 0, 1)
+    
+    ds_hr = ds.chunk({'time': 'auto'})
+    ds_hr = ds_hr.fillna(0)
+    
+    # Create a copy of rad_day for convolved data
+    ds_hr_convolved = rad_day.copy()
+    
+    # Assign convolved values to new variables
+    ds_hr_convolved['fcst_raw'] = ds_hr * ds_mask
+    ds_hr_convolved['fcst_object_id'] = ds_mask  
+
+def Create_3D_Mask(MTD_Cube,label_0):
+
+    ### Lists of all new labeled objects for all time steps
+    Mod_Objects=list()
+    ### Lists of  properties of all new labeled objects for all time steps
+    Mod_Objects_prop_list=list()
+    ### lists of Modobjects timesteps
+    Mod_Objects_prop_list_timestep=list()
+    ######### objects for all time steps identified by MTD
+    Objects=np.copy(MTD_Cube)           
+    IDNo=label_0
+    ##### this is the lists of merged or sperated objects
+    appendedpoints=list()
+    ############ Start of splitting i=5 and j=3 run the above codes
+    file_counter=0
+    batch_counter=0
+
+    for step in range(len(Objects)):       
+        
+        if file_counter==5000:
+            batch_counter=batch_counter+1
+            print("MTD Mask Creating Step="+str(step))
+            file_counter=0
+        file_counter=file_counter+1
+        
+        if step==0:
+            ###### for this step we just name the objects randomly with IDNo
+            label_image = np.asarray(label(Objects[step]))+label_0
+            label_image[label_image==label_0]=0
+            ########################### Finding Connected objs by Convolution using MTD outputs
+            obj_no_list=list()
+            equi_obj_no_list=list()
+            obj_list_label_image=np.unique(label_image)
+            obj_list_label_image=obj_list_label_image[obj_list_label_image>0]
+            for obj_no in obj_list_label_image:
+                temp_label_image=np.copy(label_image)
+                temp_label_image[temp_label_image!=obj_no]=0
+                temp_label_image[temp_label_image==obj_no]=1
+                equi_obj_no=np.max(temp_label_image*Objects[step])
+                obj_no_list.append(obj_no)
+                equi_obj_no_list.append(equi_obj_no)
+            ################################
+            Mod_Objects.append(label_image)
+            Mod_Objects_prop_list.append(regionprops(label_image))
+            Mod_Objects_prop_list_timestep.append(step)
+            prop=regionprops(label_image)
+            IDNo=IDNo+int(len(prop))     
+        if step>0:
+            ######### Now by using label3d we are identifying the connected objects and naming them after the previous step
+            ######## If the merge or sperate we name them with a different IDNo
+            
+            ##### Current labeled objetcs
+            label_image = label(Objects[step])   
+    
+            label_image_prop=regionprops(label_image)
+            ##### Previous labeled objects
+            Mod_Objects_prop=regionprops(Mod_Objects[step-1])
+            ### we use this temp3dobj to label all objects with IDNo=1 in order to run label 3d on both previous and current field to identified connected objects at both fields because with different labels label3d is not allowed to connect two connected objects
+            Temp3Dobj=list()
+            Temp3Dobj.append(np.copy(Mod_Objects[step-1]))
+            Temp3Dobj.append(np.copy(label_image))
+            Temp3Dobj[0][Temp3Dobj[0]>0]=1
+            Temp3Dobj[1][Temp3Dobj[1]>0]=1
+            label_image3D=label(np.asarray(Temp3Dobj)) 
+            label_image3D_prop=regionprops(label_image3D)
+            counter=0      
+            for label_image3D_member in label_image3D_prop:
+
+    #            print('objNo.= '+str(counter)+' step= '+str(step))
+                counter=counter+1
+                ###### label_image3D_member.bbox shows the 3d box fits the object element 3 and zero is for time dimension for examle :(0, 166, 79, 1, 173, 82)
+                if label_image3D_member.bbox[3]==2 and label_image3D_member.bbox[0]==0:
+                    
+                    #### omitting all other objects except the selected one ### slice0 and slice1 is for just selected connected object at two different time steps
+                    imagevaset0=np.copy(label_image3D_member._label_image[0])
+                    imagevaset0[imagevaset0 != label_image3D_member.label]=0                  
+                    label_image3D_slice0=regionprops(np.asarray(imagevaset0))
+                    imagevaset1=np.copy(label_image3D_member._label_image[1])
+                    imagevaset1[imagevaset1 != label_image3D_member.label]=0
+                    label_image3D_slice1=regionprops(np.asarray(imagevaset1))
+      
+                    #### Finding the related box in previous slice:
+                    MergFinder=1
+                    for Mod_Objects_prop_member in Mod_Objects_prop:
+                        ##### ckecking if the centorid of slice 0 from a label 3d output is equivalent with which object's cetroid from previuos step or not
+                        if label_image3D_slice0[0].centroid == Mod_Objects_prop_member.centroid:
+                             newlabel=Mod_Objects_prop_member.label
+                             MergFinder=0 
+                             
+                    SeperationFinder=1          
+                    for label_image_prop_member in label_image_prop:
+                         
+                         if label_image3D_slice1[0].centroid == label_image_prop_member.centroid:
+                             oldlabel=label_image_prop_member.label                           
+                             SeperationFinder=0 
+                          #### Handling merged objects                
+                    if MergFinder==1 and SeperationFinder!=1:
+                        IDNo=IDNo+1
+                        newlabel=IDNo
+                        ############# find the connectivities ... labels that are connected after each seperation aor merging process
+    
+                        Devided_Merged_Last_Step_prop=regionprops(label(np.asarray(imagevaset0)))
+                        for obj0 in Devided_Merged_Last_Step_prop:
+                            for obj0ref in Mod_Objects_prop:         
+                                if obj0.centroid == obj0ref.centroid:
+                                    if (obj0ref.label,newlabel) not in appendedpoints and (newlabel,obj0ref.label) not in appendedpoints:
+                                        appendedpoints.append((obj0ref.label,newlabel))
+                        ############ handling the separation
+                    
+                    if SeperationFinder==1:
+                        oldlabellist=list()
+                        newlabellist=list()
+                        centroids1=list()
+                        Area1=list()
+                        plist=list()
+                        ID1=list()
+    
+                        Devided_Merged_Current_Step_prop=regionprops(label(np.asarray(imagevaset1)))
+                        for objj in Devided_Merged_Current_Step_prop:
+                            for label_image_prop_member in label_image_prop:
+                                if objj.centroid == label_image_prop_member.centroid:
+                                    plist.append(label_image_prop_member.centroid)
+                                    oldlabellist.append(label_image_prop_member.label )
+                                    IDNo=IDNo+1
+                                    newlabellist.append(IDNo) #### 
+                                    centroids1.append(label_image_prop_member.centroid)
+                                    Area1.append(label_image_prop_member.area)
+                                    ID1.append(IDNo)
+                        
+                             
+                    if SeperationFinder==0:         
+                        label_image[label_image==oldlabel]=-1*newlabel
+                    if SeperationFinder==1:
+                        iiii=0
+    
+                        for labels in oldlabellist: 
+                            label_image[label_image==labels]=-1*newlabellist[iiii]                       
+                            iiii=iiii+1
+                            
+                         ########### find the connectivities
+                        Area0=list()
+                        centroids0=list()
+                        ID0=list()
+                        Devided_Merged_Last_Step_prop=regionprops(label(np.asarray(imagevaset0)))
+                        for obj0 in Devided_Merged_Last_Step_prop:
+                            for obj0ref in Mod_Objects_prop:         
+                                if obj0.centroid == obj0ref.centroid:
+                                    Area0.append(obj0ref.area)
+                                    centroids0.append(obj0ref.centroid)
+                                    ID0.append(obj0ref.label)
+                ####################################### For considering all invovling connected points                      
+    
+                        for r0 in range(len(Area0)):
+                            for r1 in range(len(Area1)):
+                                p0=ID0[r0]
+                                p1=ID1[r1]
+                                if (p0,p1) not in appendedpoints and (p1,p0) not in appendedpoints:
+                                    appendedpoints.append((p0,p1))
+ 
+                ######### Handling new objects:
+                if label_image3D_member.bbox[3]==2 and label_image3D_member.bbox[0]==1:
+                    IDNo=IDNo+1
+                    for label_image_prop_member in label_image_prop:
+                        x=label_image3D_member.centroid[1]
+                        y=label_image3D_member.centroid[2]
+                        if (x,y) == label_image_prop_member.centroid:
+                            oldlabel=label_image_prop_member.label 
+                            newlabel=IDNo
+                    label_image[label_image==oldlabel]=-1*newlabel
+            label_image=np.absolute(label_image)  
+    
+            Mod_Objects.append(label_image)
+            
+    Connections= list(OrderedDict.fromkeys(appendedpoints))
+    return Mod_Objects,Connections
+
+### starting object label number default is 0
+label_0 = 0  # Initialize the starting label number for objects
+
+connection_list = []  # Initialize an empty list to store connections between objects
+
+# Create a copy of the convolved radar dataset
+Radarfile = ds_hr_convolved.copy()
+
+# Extract the forecast object IDs and raw data arrays from the radar dataset
+MTD_Cube = Radarfile['fcst_object_id'].values
+MTD_Cube = np.nan_to_num(MTD_Cube, nan=0)  # Replace NaN values with 0
+Raw_Cube = Radarfile['fcst_raw'].values
+
+# Perform object segmentation and labeling across time steps
+# The function Create_3D_Mask returns labeled objects and connections between them
+Mod_Objects, Connections = Create_3D_Mask(MTD_Cube, label_0)
+
+# Update the starting label number based on the maximum label found in Mod_Objects
+if len(np.unique(Mod_Objects)) > 1:
+    label_0 = np.max(np.unique(Mod_Objects))
+
+# Convert Mod_Objects to a NumPy array and update the 'fcst_object_id' variable in Radarfile
+Mod_Objects = np.asarray(Mod_Objects)
+Radarfile['fcst_object_id'].values = Mod_Objects
+
+# Define encoding options for saving the Radarfile dataset
+encoding = {var: {'zlib': True, 'complevel': 5} for var in Radarfile.variables}
+
+# If connections between objects are found, store them in connections_array
+if len(Connections) > 0:
+    connections_array = np.array(list(Connections), dtype=object)
+#### here we are calculating the object properties in 2 ways:
+#### 1) object properties for each time-step. Like area, shape, volume, max intensity and average intensity
+#### 2) object properties for between two time-steps, like velocity, direction. In this part, we also calculate the average area and other properties from the previous step for two consecutive time-step
+
+##### thunderstorm properties for 10 minutes
+
+# Function to calculate Euclidean distance between two points
+def Cal_Distance(point1, point2):
+    dy = point2[0] - point1[0]
+    dx = point2[1] - point1[1]
+    dist = ((dy)**2 + (dx)**2)**0.5 
+    return dist
+
+# Function to calculate the average of two datetime objects
+def date_average(date0, date1):
+    return date0 + (date1 - date0) / 2
+
+# Function to calculate velocity between two points
+def Cal_Velocity(point1, point2, dt):
+    dy = point2[0] - point1[0]
+    dx = point2[1] - point1[1]
+    Speed = ((dy)**2 + (dx)**2)**0.5 / (dt / 60)  # 0.5 is for 30 min / 60 min means per hour
+    return Speed
+
+# Function to calculate speed given two points and time difference
+def calc_speed(x0, x1, y0, y1, dt):
+    dx = x1 - x0
+    dy = y1 - y0
+    return ((dy)**2 + (dx)**2)**0.5 / (dt / 60)
+
+# Function to create a one-dimensional mask from a reference array and a given ID
+def create_one_d_mask(ref_arr, Id):
+    arr = np.copy(ref_arr)
+    arr[arr != Id] = 0
+    arr[arr == Id] = 1
+    return arr
+
+# Function to calculate the angle between two points
+def calc_angle(x1, y1, x2, y2):
+    myradians = math.atan2(y2 - y1, x2 - x1)
+    mydegrees = math.degrees(myradians)
+    return mydegrees
+    
+#### finding the pixels on the radar borders to find which ones are touching the radar
+
+# Load radar coverage mask data
+land_mask = xr.open_dataset('sample_data/radar_coverage_mask.nc').rainrate[0].values
+
+# Initialize border array to identify pixels on the radar borders
+border_array = np.zeros((len(land_mask), len(land_mask[0])))
+
+# Loop through the land mask data to identify pixels on the border
+for i in range(len(border_array)):
+    for j in range(len(border_array[0]) - 1):
+        if land_mask[i][j] < 0 and land_mask[i][j + 1] >= 0:
+            border_array[i][j + 1] = 1
+            border_array[i][j + 2] = 1
+            border_array[i][j + 3] = 1
+        if land_mask[i][j] >= 0 and land_mask[i][j + 1] < 0:
+            border_array[i][j - 1] = 1
+            border_array[i][j - 2] = 1
+            border_array[i][j - 3] = 1
+        if ((i - 150)**2 + (j - 150)**2)**0.5 == 150 or ((i - 150)**2 + (j - 150)**2)**0.5 == 149 or ((i - 150)**2 + (j - 150)**2)**0.5 == 148:
+            border_array[i][j] = 1
+
+# Check for border pixels in the vertical direction
+for j in range(len(border_array)):
+    for i in range(len(border_array[0]) - 1):
+        if land_mask[i][j] < 0 and land_mask[i + 1][j] >= 0:
+            border_array[i + 1][j] = 1
+            border_array[i + 2][j] = 1
+            border_array[i + 3][j] = 1
+        if land_mask[i][j] >= 0 and land_mask[i + 1][j] < 0:
+            border_array[i - 1][j] = 1
+            border_array[i - 2][j] = 1
+            border_array[i - 3][j] = 1
+        if ((i - 150)**2 + (j - 150)**2)**0.5 == 150:
+            border_array[i][j] = 1
+
+# Function to find labels of objects that touch the radar border
+def find_touched(twod_array):
+    twod_array = np.asarray(twod_array)
+    labelll = np.unique(border_array * twod_array)
+    labelll
+### MTD_cube is the 3D tracked data
+### Raw_cube is the 3D Raw data
+
+def Storm_Info(MTD_Cube, Raw_Cube, dt, dates_array, area_threshold):
+    Mod_Objects_prop_list = list()
+    Mod_Objects = np.copy(MTD_Cube)
+    touched_labels = list()
+    
+    # Loop through each time step to process object properties
+    for t in range(len(Mod_Objects)):
+        touched_labels_temp = list()
+        props = regionprops(np.asarray(Mod_Objects[t]).astype(int))
+        touched_labelz = find_touched(Mod_Objects[t])
+        
+        # Identify touched labels for each time step
+        for ppp in range(len(props)):
+            if props[ppp].label in touched_labelz:
+                touched_labels_temp.append(1)
+            else:
+                touched_labels_temp.append(0)
+        touched_labels.append(touched_labels_temp)
+        Mod_Objects_prop_list.append(regionprops(np.asarray(Mod_Objects[t]).astype(int)))  
+    
+    Datalist = np.copy(Raw_Cube)  
+
+    # Initialize lists to store object properties
+    NoH_obj_area_list = list()
+    NoH_obj_centroid_list = list()
+    NoH_obj_label_touched_labelslist = list()
+    NoH_obj_Iv_list = list()
+    NoH_obj_Ismax_list = list()
+    NoH_obj_orientation_list = list()
+    NoH_obj_aspectratio_list = list()    
+    NoH_obj_dates_list = list()
+    NoH_obj_touched_list = list()
+    NoH_obj_label_list = list()
+    
+    # Loop through each time step to extract object properties
+    for i in range(len(Mod_Objects_prop_list)):
+        for j in range(len(Mod_Objects_prop_list[i])):
+            if Mod_Objects_prop_list[i][j].minor_axis_length != 0 and Mod_Objects_prop_list[i][j].major_axis_length != 0 and Mod_Objects_prop_list[i][j].area > area_threshold and np.sum(Mod_Objects_prop_list[i][j]._label_image * Datalist[i]) > 0:
+                NoH_obj_area_list.append(Mod_Objects_prop_list[i][j].area)
+                NoH_obj_centroid_list.append(Mod_Objects_prop_list[i][j].centroid)   
+                NoH_obj_label_list.append(Mod_Objects_prop_list[i][j].label)
+                lb = Mod_Objects_prop_list[i][j].label
+                image = np.copy(Mod_Objects_prop_list[i][j]._label_image)
+                image[image != lb] = 0
+                image[image == lb] = 1
+                NoH_obj_Ismax_list.append(np.max(image * Datalist[i]))
+                NoH_obj_Iv_list.append(np.sum(image * Datalist[i]) * 1000)
+                obj_aspectratio = Mod_Objects_prop_list[i][j].minor_axis_length / Mod_Objects_prop_list[i][j].major_axis_length
+                NoH_obj_aspectratio_list.append(obj_aspectratio)
+                NoH_obj_orientation_list.append(math.degrees(Mod_Objects_prop_list[i][j].orientation))                
+                NoH_obj_dates_list.append(dates_array[i])
+                NoH_obj_touched_list.append(touched_labels[i][j])
+
+    # Initialize lists to store additional object properties
+    NoH_v_list = list()
+    NoH_d_list = list()
+    NoH_a_list = list()
+    NoH_Ismax_list = list()
+    NoH_Iv_list = list()
+    NoH_orientation_list = list()
+    NoH_dir_list = list()
+    NoH_aspectratio_list = list()
+    NoH_label_list = list()
+    NoH_dates_list = list()
+    NoH_centroid_list = list()
+    NoH_touched_list = list()
+    
+    # Extract additional object properties based on consecutive time steps
+    obj_no = np.unique(NoH_obj_label_list)    
+    for i in range(len(obj_no)):
+        mask = np.copy(NoH_obj_label_list)
+        mask[mask != obj_no[i]] = 0
+        mask[mask == obj_no[i]] = 1
+        locs = np.where(mask == 1)
+        if len(locs[0]) > 1:
+            for j in range(len(locs[0]) - 1):
+                p0 = NoH_obj_centroid_list[locs[0][j]]
+                p1 = NoH_obj_centroid_list[locs[0][j + 1]]
+                x1, y1, x2, y2 = p0[1], p0[0], p1[1], p1[0]    
+                NoH_centroid_list.append((np.asarray(p1) + np.asarray(p0)) / 2)
+                NoH_dir_list.append(calc_angle(x1, y1, x2, y2))  
+                t0 = NoH_obj_dates_list[locs[0][j]]
+                t1 = NoH_obj_dates_list[locs[0][j + 1]]
+                dt_new = t1 - t0
+                dt_new = dt_new.seconds / 60
+                NoH_v_list.append(Cal_Velocity(p0, p1, dt_new))
+                NoH_d_list.append(Cal_Distance(p0, p1))
+                NoH_a_list.append((NoH_obj_area_list[locs[0][j]] + NoH_obj_area_list[locs[0][j + 1]]) / 2)
+                NoH_Ismax_list.append((NoH_obj_Ismax_list[locs[0][j]] + NoH_obj_Ismax_list[locs[0][j + 1]]) / 2)
+                NoH_Iv_list.append((NoH_obj_Iv_list[locs[0][j]] + NoH_obj_Iv_list[locs[0][j + 1]]) / 2)
+                NoH_orientation_list.append((NoH_obj_orientation_list[locs[0][j]] + NoH_obj_orientation_list[locs[0][j + 1]]) / 2)
+                NoH_aspectratio_list.append((NoH_obj_aspectratio_list[locs[0][j]] + NoH_obj_aspectratio_list[locs[0][j + 1]]) / 2)                
+                NoH_dates_list.append(date_average(NoH_obj_dates_list[locs[0][j]], NoH_obj_dates_list[locs[0][j + 1]]))
+                NoH_touched_list.append((NoH_obj_touched_list[locs[0][j]] + NoH_obj_touched_list[locs[0][j + 1]]) / 2)
+                NoH_label_list.append(obj_no[i])
+
+    return NoH_touched_list, NoH_obj_touched_list, NoH_d_list, NoH_obj_centroid_list, NoH_centroid_list, NoH_obj_dates_list, NoH_dates_list, NoH_label_list, NoH_obj_label_list, NoH_obj_aspectratio_list, NoH_aspectratio_list, NoH_dir_list, NoH_obj_area_list, NoH_a_list, NoH_obj_Iv_list, NoH_Iv_list, NoH_obj_Ismax_list, NoH_Ismax_list, NoH_v_list, NoH_obj_orientation_list, NoH_orientation_list
+def read_from_inside_file(Radarfile, dt):
+    # Extracting time information from Radarfile
+    Radarfile.time
+    # Converting time interval to minutes
+    dtt = int(dt.total_seconds() // 60)
+    # Rounding time to the nearest specified minute interval
+    rounded_time = (Radarfile.time.dt.floor(str(dtt) + 'min'))
+    # Converting rounded time to datetime array
+    dates_array = pd.to_datetime(rounded_time.values).round('min').to_pydatetime()
+    # Finding start and end dates
+    st_date = np.min(pd.to_datetime(rounded_time.values).round('min').to_pydatetime())
+    end_date = np.max(pd.to_datetime(rounded_time.values).round('min').to_pydatetime())
+    return st_date, end_date, dates_array
+
+area_threshold = 5
+
+dt = timedelta(minutes=6)  # time interval between two consecutive maps (in minute)
+# Extracting time-related information from inside the file
+st_date, end_date, dates_array = read_from_inside_file(Radarfile, dt)
+# Extracting 3D tracked and raw data from Radarfile
+MTD_Cube = Radarfile.variables['fcst_object_id'][:, :, :]
+Raw_Cube = Radarfile.variables['fcst_raw'][:, :, :]
+
+# Checking if the length of MTD_Cube is greater than 2 and there are multiple unique values in MTD_Cube
+if len(MTD_Cube) > 2 and len(np.unique(MTD_Cube)) > 1:
+    # Calculating time interval in minutes
+    detlta_t = dt.seconds / 60
+
+    # Checking if the sum of MTD_Cube is not zero
+    if np.sum(MTD_Cube) != 0:
+        # Extracting storm information using Storm_Info function
+        touched_list, obj_touched_list, d_list, obj_centroid_list0, centroid_list0, obj_dates_list, dates_list, label_list, obj_label_list, obj_aspectratio_list, aspectratio_list, dir_list, obj_area_list, a_list, obj_Iv_list, Iv_list, obj_Ismax_list, Ismax_list, v_list, obj_orientation_list, orientation_list = Storm_Info(MTD_Cube, Raw_Cube, detlta_t, dates_array, area_threshold)
+obj_centroid_x_list = list()
+obj_centroid_y_list = list()
+centroid_x_list = list()
+centroid_y_list = list()
+
+## Separating x and y components of centroids
+# Extracting x and y components of object centroids if available
+if len(obj_centroid_list0) > 0:
+    obj_centroid_x_list = list(np.asarray(obj_centroid_list0)[:, 1])
+    obj_centroid_y_list = list(np.asarray(obj_centroid_list0)[:, 0])
+else:
+    obj_centroid_x_list = []
+    obj_centroid_y_list = []
+
+# Extracting x and y components of centroids if available
+if len(centroid_list0) > 0:
+    centroid_x_list = list(np.asarray(centroid_list0)[:, 1])
+    centroid_y_list = list(np.asarray(centroid_list0)[:, 0])
+else:
+    centroid_x_list = []
+    centroid_y_list = []
+
+# Calculating average intensity per unit area
+Iave_list = list(np.asarray(Iv_list) / (np.asarray(a_list) * 1000000) * 1000)
+obj_Iave_list = list(np.asarray(obj_Iv_list) / (np.asarray(obj_area_list) * 1000000) * 1000)
+
+# Creating DataFrame for individual radar objects
+Radar_data_obj = pd.DataFrame()    
+Radar_data_obj['touched_borders?'] = obj_touched_list
+Radar_data_obj['Centroid_X'] = obj_centroid_x_list
+Radar_data_obj['Centroid_Y'] = obj_centroid_y_list
+Radar_data_obj['datetime'] = obj_dates_list
+Radar_data_obj['label'] = obj_label_list
+Radar_data_obj['aspectratio'] = obj_aspectratio_list
+Radar_data_obj['area'] = obj_area_list
+Radar_data_obj['Iv'] = obj_Iv_list
+Radar_data_obj['Ismax'] = obj_Ismax_list
+Radar_data_obj['orientation'] = obj_orientation_list
+Radar_data_obj['Iave'] = obj_Iave_list
+
+# Creating DataFrame for averaged radar data
+Radar_data_ave = pd.DataFrame()
+Radar_data_ave['touched_borders?'] = touched_list
+Radar_data_ave['d'] = d_list
+Radar_data_ave['Centroid_X'] = centroid_x_list
+Radar_data_ave['Centroid_Y'] = centroid_y_list
+Radar_data_ave['datetime'] = dates_list
+Radar_data_ave['label'] = label_list
+Radar_data_ave['aspectratio'] = aspectratio_list
+Radar_data_ave['Velocity'] = v_list
+Radar_data_ave['dir'] = dir_list
+Radar_data_ave['area'] = a_list
+Radar_data_ave['Iv'] = Iv_list
+Radar_data_ave['Ismax'] = Ismax_list
+Radar_data_ave['orientation'] = orientation_list
